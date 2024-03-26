@@ -1,2 +1,2 @@
-# wireless-communication-AI-competition-
+# wireless-communication-AI-competition
 code
