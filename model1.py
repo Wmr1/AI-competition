@@ -1,83 +1,106 @@
+# =======================================================================================================================
+# =======================================================================================================================
 import torch
 import torch.nn as nn
-from torchvision import models
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
-
-class CustomResNet50(nn.Module):
-    def __init__(self, pretrained=True):
-        super(CustomResNet50, self).__init__()
-        original_resnet50 = models.resnet50(pretrained=pretrained)
-        
-        self.features = nn.Sequential(
-            *list(original_resnet50.children())[:-2]  # 移除原始模型的最后一个全连接层和平均池化层
-        )
-        
+import torch.nn.functional as F
+class MLP(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(MLP, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, output_size)
+    
     def forward(self, x):
-        x = self.features(x)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
         return x
 
+class ResBlock(nn.Module):
+    def __init__(self, channel_list, H, W, **kwargs):
+        super(ResBlock, self).__init__(**kwargs)
+        self.channel_list = channel_list
+        self._conv_1 = nn.Conv2d(self.channel_list[2], self.channel_list[0], kernel_size=3, padding='same')
+        self._layer_norm_1 = nn.LayerNorm([self.channel_list[0], H, W])
+        self._conv_2 = nn.Conv2d(self.channel_list[0], self.channel_list[1], kernel_size=3, padding='same')
+        self._layer_norm_2 = nn.LayerNorm([self.channel_list[1], H, W])
+        self._relu = nn.ReLU()
+
+    def forward(self, inputs):
+        x_ini = inputs
+        x = self._layer_norm_1(x_ini)
+        x = self._relu(x)
+        x = self._conv_1(x)
+        x = self._layer_norm_2(x)
+        x = self._relu(x)
+        x = self._conv_2(x)
+        x_ini = x_ini + x
+        return x_ini
+
+NUM_SUBCARRIERS = 624
+NUM_OFDM_SYMBOLS = 12
+NUM_LAYERS = 2
+NUM_BITS_PER_SYMBOL = 4
 class Neural_receiver(nn.Module):
-    def __init__(self, subcarriers, timesymbols, streams, num_bits_per_symbol, d_model=512, nhead=8, num_layers=2):
-        super(Neural_receiver, self).__init__()
+    def __init__(self, subcarriers, timesymbols, streams, num_bits_per_symbol, num_blocks=6, channel_list=[24, 24, 24],
+                 **kwargs):
+        super(Neural_receiver, self).__init__(**kwargs)
         self.subcarriers = subcarriers
         self.timesymbols = timesymbols
         self.streams = streams
+        self.num_blocks = num_blocks
+        self.channel_list = channel_list
         self.num_bits_per_symbol = num_bits_per_symbol
+        self.NUM_SUBCARRIERS = 624
+        self.NUM_OFDM_SYMBOLS = 12
+        self.NUM_LAYERS = 2
+        self.NUM_BITS_PER_SYMBOL = 4
 
-        # 数据正则化
-        self.normalization = nn.LayerNorm([self.timesymbols, self.subcarriers, 4 * self.streams])
-
-        # 定义5层卷积层
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(4 * self.streams, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(512, 1024, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-        )
-
-        # 添加一个用于减少通道数的卷积层
-        self.channel_reduction = nn.Conv2d(1024, 3, kernel_size=1)
-
-        self.resnet50 = CustomResNet50()
-
-        # Transformer配置
-        transformer_layer = TransformerEncoderLayer(d_model=1024, nhead=nhead, dim_feedforward=2048, dropout=0.1, batch_first=True)
-        self.transformer_encoder = TransformerEncoder(transformer_layer, num_layers=num_layers)
-
-        # MLP
-        self.mlp = nn.Sequential(
-            nn.Linear(40960, 1024),  # 修改这里
-            nn.ReLU(),
-            nn.Linear(1024, self.streams * self.num_bits_per_symbol * self.subcarriers * self.timesymbols)
-        )
+        self.blocks = nn.Sequential()
+        for block_id in range(self.num_blocks):
+            block = ResBlock(channel_list=self.channel_list, H=self.timesymbols, W=self.subcarriers)
+            self.blocks.add_module(name='block_{}'.format(block_id), module=block)
+        self._conv_1 = nn.Conv2d(4 * self.streams, self.channel_list[2], kernel_size=3, padding='same')
+        self._conv_2 = nn.Conv2d(self.channel_list[1], self.streams * self.num_bits_per_symbol, kernel_size=3,
+                                 padding='same')
 
     def forward(self, y, template_pilot):
+        # y : [batch size,NUM_LAYERS,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,2]
+        # template_pilot : [batch size,NUM_LAYERS,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,2]
         batch_size = y.shape[0]
-        
-        z = torch.cat([y, template_pilot], dim=-1)  # 合并y和template_pilot
-        
-        z = self.normalization(z.permute(0, 2, 3, 1, 4).reshape(batch_size, self.timesymbols, self.subcarriers, -1))  # 数据正则化
-        z = z.reshape(batch_size, self.timesymbols, self.subcarriers, -1).permute(0, 3, 1, 2)  # 调整维度
-        
-        z = self.conv_layers(z)  # 通过5层卷积
+        y = y.permute(0, 2, 3, 1, 4)  # y :  [batch size,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,NUM_LAYERS,2]
+        y = torch.reshape(y, (batch_size, self.timesymbols, self.subcarriers, self.streams * 2))
+        # y :  [batch size,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,NUM_LAYERS*2]
+        template_pilot = template_pilot.permute(0, 2, 3, 1, 4)
+        # p :  [batch size,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,NUM_LAYERS,2]
+        template_pilot = torch.reshape(template_pilot,
+                                       (batch_size, self.timesymbols, self.subcarriers, self.streams * 2))
 
-        z = self.channel_reduction(z)  # 通过新增加的卷积层减少通道数
+        z = torch.cat([y, template_pilot], dim=-1)
+        # 按最后一个维度切成8份，并确保每个切片形状正确
+        z_splits = [z_split.contiguous().view(-1, 1) for z_split in z.split(1, dim=-1)]  # 列表，包含8个形状为 [batch_size * NUM_OFDM_SYMBOLS * NUM_SUBCARRIERS, 1] 的张量
+        
+        # 定义 MLP，假设隐藏层大小为256，输出层为NUM_BITS_PER_SYMBOL，输入大小现在是1
+        mlps = [MLP(1, 256, self.num_bits_per_symbol).to(z.device) for _ in range(8)]
+        
+        # 对每份应用 MLP
+        z_processed = [mlp(z_split) for z_split, mlp in zip(z_splits, mlps)]
+        
+        # 在最后一个维度上拼接处理过的张量，并重塑形状
+        z_concat = torch.cat(z_processed, dim=1).view(batch_size, self.NUM_OFDM_SYMBOLS, self.NUM_SUBCARRIERS, -1)
+        # import pdb;
+        # pdb.set_trace()
+        mlp = MLP(input_size=32, hidden_size=64,output_size=8).to(z_concat.device)
+        # Reshape z_concat for MLP processing
+        # Flatten the dimensions except for the last one
+        z_flattened = z_concat.view(-1, 32)
 
-        z = self.resnet50(z)  # 现在可以正确地通过CustomResNet50了
+        # Process through the MLP
+        z_mlp_processed = mlp(z_flattened)
         
-        # 调整z的形状以匹配Transformer的期望输入形状
-        z_flat = z.reshape(batch_size, -1, 1024)  # 假设ResNet50的输出特征维度为1024
-        z_trans = self.transformer_encoder(z_flat)
-        
-        z = z_trans.view(batch_size, -1)  # 将Transformer输出展平
-        
-        z = self.mlp(z)  # 通过MLP进行最终预测
-        
-        z = z.view(batch_size, self.streams, self.timesymbols, self.subcarriers, self.num_bits_per_symbol)  #
-        return z
+        # 重塑张量以匹配期望的输出形状
+        z_reshaped = z_mlp_processed.view(batch_size, self.NUM_LAYERS, self.NUM_OFDM_SYMBOLS, self.NUM_SUBCARRIERS, self.NUM_BITS_PER_SYMBOL)
+        # NUM_LAYERS, NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,NUM_BITS_PER_SYMBOL
+        # Assuming z_reshaped has the shape [batch_size, NUM_LAYERS, NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS, NUM_BITS_PER_SYMBOL]
+
+        z_softmax = F.softmax(z_reshaped, dim=-1)
+        return z_softmax
+
