@@ -2,7 +2,17 @@
 # =======================================================================================================================
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
+class MLP(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(MLP, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, output_size)
+    
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
 
 class ResBlock(nn.Module):
     def __init__(self, channel_list, H, W, **kwargs):
@@ -46,18 +56,19 @@ class Neural_receiver(nn.Module):
                                  padding='same')
 
     def forward(self, y, template_pilot):
-        # y : [batch size,NUM_LAYERS,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,2]
-        # template_pilot : [batch size,NUM_LAYERS,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,2]
+        # y : [batch size,self.streams,self.timesymbols, self.subcarriers,2]
+        # template_pilot : [batch size,self.streams,self.timesymbols, self.subcarriers,2]
         batch_size = y.shape[0]
-        y = y.permute(0, 2, 3, 1, 4)  # y :  [batch size,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,NUM_LAYERS,2]
+        y = y.permute(0, 2, 3, 1, 4)  # y :  [batch size,self.timesymbols, self.subcarriers,self.streams,2]
         y = torch.reshape(y, (batch_size, self.timesymbols, self.subcarriers, self.streams * 2))
-        # y :  [batch size,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,NUM_LAYERS*2]
+        # y :  [batch size,self.timesymbols, self.subcarriers,self.streams*2]
         template_pilot = template_pilot.permute(0, 2, 3, 1, 4)
-        # p :  [batch size,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,NUM_LAYERS,2]
+        # p :  [batch size,self.timesymbols, self.subcarriers,self.streams,2]
         template_pilot = torch.reshape(template_pilot,
                                        (batch_size, self.timesymbols, self.subcarriers, self.streams * 2))
 
         z = torch.cat([y, template_pilot], dim=-1)
+
         # Channel first
         z = z.permute(0, 3, 1, 2)
         # Input conv
@@ -66,12 +77,12 @@ class Neural_receiver(nn.Module):
         z = self.blocks(z)
         # Output conv
         z = self._conv_2(z)
-        # z :  [batch size, NUM_LAYERS*NUM_SUBCARRIERS, NUM_BITS_PER_SYMBOL, NUM_OFDM_SYMBOLS]
+        # z :  [batch size, self.streams*self.subcarriers, self.num_bits_per_symbol, self.timesymbols]
         # Channel last
         z = z.permute(0, 2, 3, 1)
-        # z :  [batch size,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS, NUM_LAYERS*NUM_BITS_PER_SYMBOL]
+        # z :  [batch size,self.timesymbols, self.subcarriers, self.streams*self.num_bits_per_symbol]
         z = torch.reshape(z, (batch_size, self.timesymbols, self.subcarriers, self.streams, self.num_bits_per_symbol))
-        # z :  [batch size,NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS, NUM_LAYERS, NUM_BITS_PER_SYMBOL]
+        # z :  [batch size,self.timesymbols, self.subcarriers, self.streams, self.num_bits_per_symbol]
         z = z.permute(0, 3, 1, 2, 4)
-        # z : [batch size, NUM_LAYERS, NUM_OFDM_SYMBOLS, NUM_SUBCARRIERS,NUM_BITS_PER_SYMBOL)
+        # z : [batch size, self.streams, self.timesymbols, self.subcarriers,self.num_bits_per_symbol]
         return z

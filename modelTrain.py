@@ -4,7 +4,7 @@ import os
 import numpy as np
 import h5py
 
-from modelDesign import *
+from modelResnet import *
 device = torch.device('cuda:1')
 # Parameters Setting
 # ========================================================
@@ -21,7 +21,7 @@ NUM_BITS_PER_SYMBOL = 4
 # NUM_BITS_PER_SYMBOL = 6
 
 
-EPOCHS = 200
+EPOCHS = 8000
 train_dataset_dir = '/data/whr/wn/data/' # Please set parameters according to your local path of data
 
 # Data Loading
@@ -74,7 +74,8 @@ criterion = nn.BCEWithLogitsLoss().to(device)
 
 
 optimizer = torch.optim.Adam(Model.parameters(), lr=1e-3)
-
+best_val_loss = 100
+best_val_acc = 0
 
 # Model Training and Saving
 # =========================================================
@@ -84,8 +85,19 @@ for epoch in range(EPOCHS):
     ModelInput1, ModelInput2, label = generator(16, rx_signal_train, pilot_train, tx_bits_train)
     ModelInput1, ModelInput2, label = ModelInput1.to(device), ModelInput2.to(device), label.to(device)
     ModelOutput = Model(ModelInput1, ModelInput2)
+    label = label.float()  # 确保标签是浮点数类型
+
     loss = criterion(ModelOutput, label)
-    predict = torch.where(ModelOutput >= 0, 1.0, 0.0)
+    # print(ModelOutput)
+    # predict = torch.where(ModelOutput >= 0.1, 1.0, 0.0)
+
+    # score = torch.where(predict == label, 1.0, 0.0)
+    # acc = torch.mean(score)
+    # 计算模型输出的概率
+    ModelOutput_prob = torch.sigmoid(ModelOutput)
+    # 使用0.5阈值（或其他自定义阈值）进行二值化
+    predict = torch.where(ModelOutput_prob >= 0.5, 1.0, 0.0)
+    # 计算准确率
     score = torch.where(predict == label, 1.0, 0.0)
     acc = torch.mean(score)
     optimizer.zero_grad()
@@ -99,7 +111,7 @@ for epoch in range(EPOCHS):
         val_ModelInput1, val_ModelInput2, val_label = val_ModelInput1.to(device), val_ModelInput2.to(device), val_label.to(device)
         val_ModelOutput = Model(val_ModelInput1, val_ModelInput2)
         val_loss = criterion(val_ModelOutput, val_label).item()
-        val_predict = torch.where(val_ModelOutput >= 0, 1.0, 0.0)
+        val_predict = torch.where(val_ModelOutput >= 0.5, 1.0, 0.0)
         val_score = torch.where(val_predict == val_label, 1.0, 0.0)
         val_acc = torch.mean(val_score)
         print(
@@ -107,7 +119,10 @@ for epoch in range(EPOCHS):
                 epoch, loss=loss.item(), acc=acc, val_loss=val_loss, val_acc=val_acc, learning_rate=optimizer.param_groups[0]['lr']))
         if val_loss < bestLoss:
             # Model saving
+            best_val_loss = val_loss
+            best_val_acc = val_acc
             torch.save(Model, 'receiver_1.pth.tar')
             print("Model saved")
             bestLoss = val_loss
+print(f'best_val_loss:{best_val_loss}, best_val_acc:{best_val_acc}')
 print('Training for case_1 is finished!')
